@@ -4,7 +4,7 @@
 
 # Delphix DCT API MCP Server
 
-The Delphix DCT API MCP Server provides a robust Model Context Protocol (MCP) interface for interacting with the Delphix Data Control Tower (DCT) API. This service enables AI assistants and client applications to access Delphix's test data management capabilities through a secure, structured toolset.
+The Delphix DCT API MCP Server provides a robust Model Context Protocol (MCP) interface for interacting with the Delphix Data Control Tower (DCT) API. This service enables AI assistants and client applications to securly access test data management capabilities through a structured toolset.
 
 ## Table of Contents
 - [Features](#features)
@@ -26,7 +26,7 @@ The Delphix DCT API MCP Server provides a robust Model Context Protocol (MCP) in
 - **Security and reliability**: API client includes retry logic, exponential backoff, and SSL configuration.  
 - **Flexible configuration**: Environment-based setup with validation.
 - **Cross-platform support**: Startup scripts for Windows, macOS, and Linux.
-- **Structured logging**: Application and session logging with telemetry tracking
+- **Structured logging**: Application and session logging with telemetry tracking.
 - **Telemetry (Optional)**: Usage analytics are disabled by default and require user consent.
 
 
@@ -47,7 +47,7 @@ Configure the MCP server within your AI client application (such as Claude Deskt
   - Engines
   - Virtualization and Compliance Job Executions
   - All Virtualization Storage Insights
-- **uv** (recommended): Install from [uv](https://pypi.org/project/uv/) for the easiest setup (provides the `uvx` command)
+- **uv** (recommended): Install using [uv](https://pypi.org/project/uv/). This method provides access to the uvx command. 
 - **OR Python 3.11+**: If not using uv/uvx
 
 **Next step:** Proceed to [MCP Client Configuration](#mcp-client-configuration) to complete setup.
@@ -733,7 +733,7 @@ This project is licensed under the MIT License - see the [LICENSE.md](LICENSE.md
 
 ### Contributing
 
-We welcome contributions from the community! Before you start, please review our community documents:
+We welcome contributions! Please review our community documents:
 
 - **[Community Guidelines](.github/COMMUNITY_GUIDELINES.md)**: An overview of how our community operates.
 - **[Code of Conduct](.github/CODE_OF_CONDUCT.md)**: Our commitment to a respectful and inclusive environment.
