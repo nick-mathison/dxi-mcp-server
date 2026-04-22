@@ -52,17 +52,17 @@ TOOLS_BY_NAME = {}
 # correctly interprets Delphix-specific jargon used as verbs in user prompts.
 TOOL_DOMAIN_HINTS = {
     "data_tool": (
-        "IMPORTANT — Delphix domain terminology:\n"
-        "  • \"dSource\" is often used as a VERB meaning \"create/link a dSource\" "
+        "IMPORTANT - Delphix domain terminology:\n"
+        "  - \"dSource\" is often used as a VERB meaning \"create/link a dSource\" "
         "(i.e. ingest a source database). When a user says "
         "\"dSource database X\", they want to LINK a new dSource for database X, "
         "NOT look up an existing dSource named X. Use the appropriate "
         "dsource_link_* action (dsource_link_oracle, dsource_link_mssql, "
         "dsource_link_ase, dsource_link_appdata) depending on the database type.\n"
-        "  • \"provision\" or \"spin up\" a VDB or \"create a golden image of a "
-        "VDB\" means creating a virtual database from a dSource or bookmark  —"
-        " use provision_by_timestamp, provision_by_snapshot, etc.\n"
-        "  • \"refresh\" a VDB means updating it with newer data from its parent — "
+        "  - \"provision\" or \"spin up\" a VDB or \"create a golden image of a "
+        "VDB\" means creating a virtual database from a dSource or bookmark -- "
+        "use provision_by_timestamp, provision_by_snapshot, etc.\n"
+        "  - \"refresh\" a VDB means updating it with newer data from its parent -- "
         "use refresh_vdb_by_timestamp, refresh_vdb_by_snapshot, etc."
     ),
 }
@@ -85,10 +85,10 @@ ACTIONS_REQUIRING_TOOLKIT_SCHEMA: dict[str, str] = {
 }
 
 _TOOLKIT_SCHEMA_HINT_COMMON = (
-    "IMPORTANT — AppData toolkit schema: "
+    "IMPORTANT - AppData toolkit schema: "
     "Before populating toolkit-specific parameters, call toolkit_tool(action='search') "
     "to list available toolkits. Filter results by the engine_id of the environment you "
-    "are operating on — use only toolkits whose engine_id matches.\n"
+    "are operating on -- use only toolkits whose engine_id matches.\n"
 )
 
 TOOLKIT_SCHEMA_HINT_DSOURCE = (
@@ -98,7 +98,7 @@ TOOLKIT_SCHEMA_HINT_DSOURCE = (
 )
 
 TOOLKIT_SCHEMA_HINT_PROVISION = (
-    "IMPORTANT — AppData VDB only: "
+    "IMPORTANT - AppData VDB only: "
     "If provisioning an AppData VDB (i.e., you need to populate 'appdata_source_params' "
     "or 'appdata_config_params'), call toolkit_tool(action='search') first and filter "
     "by the engine_id of the target environment, and use environment_user_id. "
@@ -250,7 +250,8 @@ translated_dict_for_types = {
     "float": "float",
 }
 
-prefix = """from mcp.server.fastmcp import FastMCP
+prefix = """# -*- coding: utf-8 -*-
+from mcp.server.fastmcp import FastMCP
 from typing import Dict,Any,Optional
 from dct_mcp_server.core.decorators import log_tool_execution
 from dct_mcp_server.config import get_confirmation_for_operation, requires_confirmation
@@ -513,7 +514,7 @@ def generate_tools_from_openapi():
 
         tool_file_content += create_register_tool_function(module_name, function_lists)
 
-        with open(TOOL_FILE, "w") as f:
+        with open(TOOL_FILE, "w", encoding="utf-8") as f:
             f.write(tool_file_content)
         
         logger.info(f"Generated {TOOL_FILE} with {len(function_lists)} unified tools")
