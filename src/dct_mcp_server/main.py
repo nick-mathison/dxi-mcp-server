@@ -13,6 +13,7 @@ Toolset Configuration:
 
 import asyncio
 import logging
+import os
 import signal
 import sys
 from contextlib import asynccontextmanager
@@ -166,6 +167,17 @@ async def async_main():
 
 def main():
     """Synchronous main entry point - wrapper for async_main"""
+    # On Windows, set stdin/stdout to binary mode so the MCP stdio transport
+    # (which wraps sys.stdout.buffer in a TextIOWrapper) can flush without
+    # hitting OSError [Errno 22] on the underlying console handle.
+    if sys.platform == "win32":
+        try:
+            import msvcrt
+            msvcrt.setmode(sys.stdin.fileno(), os.O_BINARY)
+            msvcrt.setmode(sys.stdout.fileno(), os.O_BINARY)
+        except (ImportError, OSError, ValueError):
+            pass
+
     setup_logging()
     logger = logging.getLogger(__name__)
     try:

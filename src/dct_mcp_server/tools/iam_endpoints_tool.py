@@ -1,14 +1,19 @@
+# -*- coding: utf-8 -*-
 from mcp.server.fastmcp import FastMCP
 from typing import Dict,Any,Optional
 from dct_mcp_server.core.decorators import log_tool_execution
 from dct_mcp_server.config import get_confirmation_for_operation, requires_confirmation
+from datetime import datetime, timezone
 import asyncio
 import logging
-import threading
-from functools import wraps
 
 client = None
 logger = logging.getLogger(__name__)
+
+class _SafeDict(dict):
+    """Returns '{key}' for missing keys so unresolvable placeholders stay readable."""
+    def __missing__(self, key):
+        return f"{{{key}}}"
 
 # =============================================================================
 # CONFIRMATION INTEGRATION
@@ -29,84 +34,62 @@ logger = logging.getLogger(__name__)
 #       }
 # =============================================================================
 
-def check_confirmation(method: str, api_path: str, action: str, tool_name: str, confirmed: bool = False, request_params: Optional[Dict[str, Any]] = None, request_body: Optional[Dict[str, Any]] = None) -> Optional[Dict[str, Any]]:
+def check_confirmation(method: str, api_path: str, action: str, tool_name: str, confirmed: bool = False, context: dict = None) -> Optional[Dict[str, Any]]:
     """Check if operation requires confirmation. Returns confirmation response or None if confirmed/not needed."""
     confirmation = get_confirmation_for_operation(method, api_path)
-    if confirmation["level"] != "none" and not confirmed:
-        # Merge query params and body into a single review dict so the LLM can
-        # render the exact payload that will be sent. None values are already
-        # stripped upstream by build_params / body filter.
-        review: Dict[str, Any] = {}
-        if request_params:
-            review.update(request_params)
-        if request_body:
-            review.update(request_body)
-        is_review_critical = action.startswith("provision_") or action.startswith("dsource_link_") or action == "dsource_create_snapshot"
-        instructions = (
-            "STOP: You MUST display the confirmation_message to the user and wait for their EXPLICIT "
-            "approval before re-calling with confirmed=True. Do NOT proceed without user consent."
-        )
-        if is_review_critical:
-            instructions = (
-                "STOP — REVIEW AND SUBMIT: Before asking the user to confirm, render 'review_parameters' "
-                "as a Markdown table with columns | Parameter | Value | (one row per key). Then show the "
-                "'confirmation_message' and the endpoint (method + api_path). Wait for EXPLICIT user approval, "
-                "then re-call with confirmed=True and the SAME parameters. Do NOT proceed without consent."
-            )
-        return {
-            "status": "confirmation_required",
-            "confirmation_level": confirmation["level"],
-            "confirmation_message": confirmation.get("message", "Please confirm this operation."),
-            "action": action,
-            "tool": tool_name,
-            "api_path": api_path,
-            "method": method,
-            "review_parameters": review,
-            "instructions": instructions,
-        }
-    return None
 
-def async_to_sync(async_func):
-    """Utility decorator to convert async functions to sync with proper event loop handling."""
-    @wraps(async_func)
-    def wrapper(*args, **kwargs):
-        try:
-            loop = asyncio.get_event_loop()
-            if loop.is_running():
-                # Create a task and run it synchronously
-                result = None
-                exception = None
-                def run_in_thread():
-                    nonlocal result, exception
-                    try:
-                        result = asyncio.run(async_func(*args, **kwargs))
-                    except Exception as e:
-                        exception = e
-                thread = threading.Thread(target=run_in_thread)
-                thread.start()
-                thread.join()
-                if exception:
-                    raise exception
-                return result
-            else:
-                return loop.run_until_complete(async_func(*args, **kwargs))
-        except RuntimeError:
-            return asyncio.run(async_func(*args, **kwargs))
-    return wrapper
+    if confirmation["level"] == "none":
+        return None
 
-def make_api_request(method: str, endpoint: str, params: dict = None, json_body: dict = None):
+    if confirmation.get("conditional"):
+        level = confirmation["level"]
+        threshold = confirmation.get("threshold_days")
+
+        if level == "retention_check" and context and threshold is not None:
+            retain_forever = context.get("retain_forever")
+            expiration_date = context.get("expiration_date")
+
+            if retain_forever:
+                return None
+
+            if expiration_date is not None:
+                try:
+                    exp = datetime.fromisoformat(str(expiration_date).replace("Z", "+00:00"))
+                    days_until = (exp - datetime.now(timezone.utc)).days
+                    if days_until > threshold:
+                        return None
+                    context = dict(context)
+                    context["days"] = max(0, days_until)
+                except (ValueError, TypeError):
+                    pass
+
+    if confirmed:
+        return None
+
+    message = confirmation.get("message", "Please confirm this operation.")
+    if context:
+        message = message.format_map(_SafeDict(context))
+
+    return {
+        "status": "confirmation_required",
+        "confirmation_level": confirmation["level"],
+        "confirmation_message": message,
+        "action": action,
+        "tool": tool_name,
+        "api_path": api_path,
+        "instructions": "STOP: You MUST display the confirmation_message to the user and wait for their EXPLICIT approval before re-calling with confirmed=True. Do NOT proceed without user consent."
+    }
+
+async def make_api_request(method: str, endpoint: str, params: dict = None, json_body: dict = None):
     """Utility function to make API requests with consistent parameter handling."""
-    @async_to_sync
-    async def _make_request():
-        return await client.make_request(method, endpoint, params=params or {}, json=json_body)
-    return _make_request()
+    return await client.make_request(method, endpoint, params=params or {}, json=json_body)
 
 def build_params(**kwargs):
     """Build parameters dictionary excluding None and empty string values."""
     return {k: v for k, v in kwargs.items() if v is not None and v != ''}
 
 @log_tool_execution
-def iam_tool(
+async def iam_tool(
     action: str,  # One of: search_accounts, get_account, create_account, delete_account, enable_account, disable_account, reset_password, get_account_tags, add_account_tags, delete_account_tags, get_account_ui_profiles, get_password_policies, update_password_policies, search_roles, get_role, create_role, update_role, delete_role, add_role_permissions, delete_role_permissions, get_role_tags, add_role_tags, delete_role_tags, add_role_ui_profiles, delete_role_ui_profiles, search_access_groups, get_access_group, create_access_group, update_access_group, delete_access_group, add_access_group_tags, delete_access_group_tags, add_access_group_scopes, get_access_group_scope, update_access_group_scope, delete_access_group_scope, add_scope_object_tags, delete_scope_object_tags, add_scope_objects, delete_scope_objects, add_scope_always_allowed_permissions, delete_scope_always_allowed_permissions
     access_group_id: Optional[str] = None,
     account_ids: Optional[list] = None,
@@ -741,298 +724,331 @@ def iam_tool(
     # Route to appropriate API based on action
     if action == 'search_accounts':
         params = build_params(limit=limit, cursor=cursor, sort=sort)
-        body = {'filter_expression': filter_expression} if filter_expression else {}
-        conf = check_confirmation('POST', '/management/accounts/search', action, 'iam_tool', confirmed or False, request_params=params, request_body=body)
+        _ctx = {k: v for k, v in locals().items() if v is not None and not k.startswith('_')}
+        conf = check_confirmation('POST', '/management/accounts/search', action, 'iam_tool', confirmed or False, context=_ctx)
         if conf:
             return conf
-        return make_api_request('POST', '/management/accounts/search', params=params, json_body=body)
+        body = {'filter_expression': filter_expression} if filter_expression else {}
+        return await make_api_request('POST', '/management/accounts/search', params=params, json_body=body)
     elif action == 'get_account':
         if id is None:
             return {'error': 'Missing required parameter: id for action get_account'}
         endpoint = f'/management/accounts/{id}'
         params = build_params(id=id)
-        conf = check_confirmation('GET', endpoint, action, 'iam_tool', confirmed or False, request_params=params, request_body=None)
+        _ctx = {k: v for k, v in locals().items() if v is not None and not k.startswith('_')}
+        conf = check_confirmation('GET', endpoint, action, 'iam_tool', confirmed or False, context=_ctx)
         if conf:
             return conf
-        return make_api_request('GET', endpoint, params=params)
+        return await make_api_request('GET', endpoint, params=params)
     elif action == 'create_account':
         params = build_params()
-        body = {k: v for k, v in {'is_admin': is_admin, 'generate_api_key': generate_api_key, 'api_client_id': api_client_id, 'first_name': first_name, 'last_name': last_name, 'email': email, 'username': username, 'password': password, 'ldap_principal': ldap_principal, 'tags': tags}.items() if v is not None}
-        conf = check_confirmation('POST', '/management/accounts', action, 'iam_tool', confirmed or False, request_params=params, request_body=body)
+        _ctx = {k: v for k, v in locals().items() if v is not None and not k.startswith('_')}
+        conf = check_confirmation('POST', '/management/accounts', action, 'iam_tool', confirmed or False, context=_ctx)
         if conf:
             return conf
-        return make_api_request('POST', '/management/accounts', params=params, json_body=body if body else None)
+        body = {k: v for k, v in {'is_admin': is_admin, 'generate_api_key': generate_api_key, 'api_client_id': api_client_id, 'first_name': first_name, 'last_name': last_name, 'email': email, 'username': username, 'password': password, 'ldap_principal': ldap_principal, 'tags': tags}.items() if v is not None}
+        return await make_api_request('POST', '/management/accounts', params=params, json_body=body if body else None)
     elif action == 'delete_account':
         if id is None:
             return {'error': 'Missing required parameter: id for action delete_account'}
         endpoint = f'/management/accounts/{id}'
         params = build_params(id=id)
-        conf = check_confirmation('DELETE', endpoint, action, 'iam_tool', confirmed or False, request_params=params, request_body=None)
+        _ctx = {k: v for k, v in locals().items() if v is not None and not k.startswith('_')}
+        conf = check_confirmation('DELETE', endpoint, action, 'iam_tool', confirmed or False, context=_ctx)
         if conf:
             return conf
-        return make_api_request('DELETE', endpoint, params=params)
+        return await make_api_request('DELETE', endpoint, params=params)
     elif action == 'enable_account':
         if id is None:
             return {'error': 'Missing required parameter: id for action enable_account'}
         endpoint = f'/management/accounts/{id}/enable'
         params = build_params(id=id)
-        conf = check_confirmation('POST', endpoint, action, 'iam_tool', confirmed or False, request_params=params, request_body=None)
+        _ctx = {k: v for k, v in locals().items() if v is not None and not k.startswith('_')}
+        conf = check_confirmation('POST', endpoint, action, 'iam_tool', confirmed or False, context=_ctx)
         if conf:
             return conf
-        return make_api_request('POST', endpoint, params=params)
+        return await make_api_request('POST', endpoint, params=params, json_body=body if body else None)
     elif action == 'disable_account':
         if id is None:
             return {'error': 'Missing required parameter: id for action disable_account'}
         endpoint = f'/management/accounts/{id}/disable'
         params = build_params(id=id)
-        conf = check_confirmation('POST', endpoint, action, 'iam_tool', confirmed or False, request_params=params, request_body=None)
+        _ctx = {k: v for k, v in locals().items() if v is not None and not k.startswith('_')}
+        conf = check_confirmation('POST', endpoint, action, 'iam_tool', confirmed or False, context=_ctx)
         if conf:
             return conf
-        return make_api_request('POST', endpoint, params=params)
+        return await make_api_request('POST', endpoint, params=params, json_body=body if body else None)
     elif action == 'reset_password':
         if id is None:
             return {'error': 'Missing required parameter: id for action reset_password'}
         endpoint = f'/management/accounts/{id}/reset_password'
         params = build_params(id=id)
-        body = {k: v for k, v in {'new_password': new_password}.items() if v is not None}
-        conf = check_confirmation('POST', endpoint, action, 'iam_tool', confirmed or False, request_params=params, request_body=body)
+        _ctx = {k: v for k, v in locals().items() if v is not None and not k.startswith('_')}
+        conf = check_confirmation('POST', endpoint, action, 'iam_tool', confirmed or False, context=_ctx)
         if conf:
             return conf
-        return make_api_request('POST', endpoint, params=params, json_body=body if body else None)
+        body = {k: v for k, v in {'new_password': new_password}.items() if v is not None}
+        return await make_api_request('POST', endpoint, params=params, json_body=body if body else None)
     elif action == 'get_account_tags':
         if id is None:
             return {'error': 'Missing required parameter: id for action get_account_tags'}
         endpoint = f'/management/accounts/{id}/tags'
         params = build_params(id=id)
-        conf = check_confirmation('GET', endpoint, action, 'iam_tool', confirmed or False, request_params=params, request_body=None)
+        _ctx = {k: v for k, v in locals().items() if v is not None and not k.startswith('_')}
+        conf = check_confirmation('GET', endpoint, action, 'iam_tool', confirmed or False, context=_ctx)
         if conf:
             return conf
-        return make_api_request('GET', endpoint, params=params)
+        return await make_api_request('GET', endpoint, params=params)
     elif action == 'add_account_tags':
         if id is None:
             return {'error': 'Missing required parameter: id for action add_account_tags'}
         endpoint = f'/management/accounts/{id}/tags'
         params = build_params(id=id, tags=tags)
-        body = {k: v for k, v in {'tags': tags}.items() if v is not None}
-        conf = check_confirmation('POST', endpoint, action, 'iam_tool', confirmed or False, request_params=params, request_body=body)
+        _ctx = {k: v for k, v in locals().items() if v is not None and not k.startswith('_')}
+        conf = check_confirmation('POST', endpoint, action, 'iam_tool', confirmed or False, context=_ctx)
         if conf:
             return conf
-        return make_api_request('POST', endpoint, params=params, json_body=body if body else None)
+        body = {k: v for k, v in {'tags': tags}.items() if v is not None}
+        return await make_api_request('POST', endpoint, params=params, json_body=body if body else None)
     elif action == 'delete_account_tags':
         if id is None:
             return {'error': 'Missing required parameter: id for action delete_account_tags'}
         endpoint = f'/management/accounts/{id}/tags/delete'
         params = build_params(id=id)
-        body = {k: v for k, v in {'key': key, 'value': value, 'tags': tags}.items() if v is not None}
-        conf = check_confirmation('POST', endpoint, action, 'iam_tool', confirmed or False, request_params=params, request_body=body)
+        _ctx = {k: v for k, v in locals().items() if v is not None and not k.startswith('_')}
+        conf = check_confirmation('POST', endpoint, action, 'iam_tool', confirmed or False, context=_ctx)
         if conf:
             return conf
-        return make_api_request('POST', endpoint, params=params, json_body=body if body else None)
+        body = {k: v for k, v in {'key': key, 'value': value, 'tags': tags}.items() if v is not None}
+        return await make_api_request('POST', endpoint, params=params, json_body=body if body else None)
     elif action == 'get_account_ui_profiles':
         if id is None:
             return {'error': 'Missing required parameter: id for action get_account_ui_profiles'}
         endpoint = f'/management/accounts/{id}/ui-profiles'
         params = build_params(id=id)
-        conf = check_confirmation('GET', endpoint, action, 'iam_tool', confirmed or False, request_params=params, request_body=None)
+        _ctx = {k: v for k, v in locals().items() if v is not None and not k.startswith('_')}
+        conf = check_confirmation('GET', endpoint, action, 'iam_tool', confirmed or False, context=_ctx)
         if conf:
             return conf
-        return make_api_request('GET', endpoint, params=params)
+        return await make_api_request('GET', endpoint, params=params)
     elif action == 'get_password_policies':
         params = build_params()
-        conf = check_confirmation('GET', '/management/accounts/password-policies', action, 'iam_tool', confirmed or False, request_params=params, request_body=None)
+        _ctx = {k: v for k, v in locals().items() if v is not None and not k.startswith('_')}
+        conf = check_confirmation('GET', '/management/accounts/password-policies', action, 'iam_tool', confirmed or False, context=_ctx)
         if conf:
             return conf
-        return make_api_request('GET', '/management/accounts/password-policies', params=params)
+        return await make_api_request('GET', '/management/accounts/password-policies', params=params)
     elif action == 'update_password_policies':
         params = build_params()
-        body = {k: v for k, v in {'enabled': enabled, 'min_length': min_length, 'reuse_disallow_limit': reuse_disallow_limit, 'digit': digit, 'uppercase_letter': uppercase_letter, 'lowercase_letter': lowercase_letter, 'special_character': special_character, 'disallow_username_as_password': disallow_username_as_password, 'maximum_password_attempts': maximum_password_attempts}.items() if v is not None}
-        conf = check_confirmation('PATCH', '/management/accounts/password-policies', action, 'iam_tool', confirmed or False, request_params=params, request_body=body)
+        _ctx = {k: v for k, v in locals().items() if v is not None and not k.startswith('_')}
+        conf = check_confirmation('PATCH', '/management/accounts/password-policies', action, 'iam_tool', confirmed or False, context=_ctx)
         if conf:
             return conf
-        return make_api_request('PATCH', '/management/accounts/password-policies', params=params, json_body=body if body else None)
+        body = {k: v for k, v in {'enabled': enabled, 'min_length': min_length, 'reuse_disallow_limit': reuse_disallow_limit, 'digit': digit, 'uppercase_letter': uppercase_letter, 'lowercase_letter': lowercase_letter, 'special_character': special_character, 'disallow_username_as_password': disallow_username_as_password, 'maximum_password_attempts': maximum_password_attempts}.items() if v is not None}
+        return await make_api_request('PATCH', '/management/accounts/password-policies', params=params, json_body=body if body else None)
     elif action == 'search_roles':
         params = build_params(limit=limit, cursor=cursor, sort=sort)
-        body = {'filter_expression': filter_expression} if filter_expression else {}
-        conf = check_confirmation('POST', '/roles/search', action, 'iam_tool', confirmed or False, request_params=params, request_body=body)
+        _ctx = {k: v for k, v in locals().items() if v is not None and not k.startswith('_')}
+        conf = check_confirmation('POST', '/roles/search', action, 'iam_tool', confirmed or False, context=_ctx)
         if conf:
             return conf
-        return make_api_request('POST', '/roles/search', params=params, json_body=body)
+        body = {'filter_expression': filter_expression} if filter_expression else {}
+        return await make_api_request('POST', '/roles/search', params=params, json_body=body)
     elif action == 'get_role':
         if role_id is None:
             return {'error': 'Missing required parameter: role_id for action get_role'}
         endpoint = f'/roles/{role_id}'
         params = build_params()
-        conf = check_confirmation('GET', endpoint, action, 'iam_tool', confirmed or False, request_params=params, request_body=None)
+        _ctx = {k: v for k, v in locals().items() if v is not None and not k.startswith('_')}
+        conf = check_confirmation('GET', endpoint, action, 'iam_tool', confirmed or False, context=_ctx)
         if conf:
             return conf
-        return make_api_request('GET', endpoint, params=params)
+        return await make_api_request('GET', endpoint, params=params)
     elif action == 'create_role':
         params = build_params(name=name, permission_objects=permission_objects)
-        body = {k: v for k, v in {'name': name, 'description': description, 'permission_objects': permission_objects, 'immutable': immutable, 'tags': tags, 'ui_profiles': ui_profiles}.items() if v is not None}
-        conf = check_confirmation('POST', '/roles', action, 'iam_tool', confirmed or False, request_params=params, request_body=body)
+        _ctx = {k: v for k, v in locals().items() if v is not None and not k.startswith('_')}
+        conf = check_confirmation('POST', '/roles', action, 'iam_tool', confirmed or False, context=_ctx)
         if conf:
             return conf
-        return make_api_request('POST', '/roles', params=params, json_body=body if body else None)
+        body = {k: v for k, v in {'name': name, 'description': description, 'permission_objects': permission_objects, 'immutable': immutable, 'tags': tags, 'ui_profiles': ui_profiles}.items() if v is not None}
+        return await make_api_request('POST', '/roles', params=params, json_body=body if body else None)
     elif action == 'update_role':
         if role_id is None:
             return {'error': 'Missing required parameter: role_id for action update_role'}
         endpoint = f'/roles/{role_id}'
         params = build_params()
-        body = {k: v for k, v in {'name': name, 'description': description}.items() if v is not None}
-        conf = check_confirmation('PATCH', endpoint, action, 'iam_tool', confirmed or False, request_params=params, request_body=body)
+        _ctx = {k: v for k, v in locals().items() if v is not None and not k.startswith('_')}
+        conf = check_confirmation('PATCH', endpoint, action, 'iam_tool', confirmed or False, context=_ctx)
         if conf:
             return conf
-        return make_api_request('PATCH', endpoint, params=params, json_body=body if body else None)
+        body = {k: v for k, v in {'name': name, 'description': description}.items() if v is not None}
+        return await make_api_request('PATCH', endpoint, params=params, json_body=body if body else None)
     elif action == 'delete_role':
         if role_id is None:
             return {'error': 'Missing required parameter: role_id for action delete_role'}
         endpoint = f'/roles/{role_id}'
         params = build_params()
-        conf = check_confirmation('DELETE', endpoint, action, 'iam_tool', confirmed or False, request_params=params, request_body=None)
+        _ctx = {k: v for k, v in locals().items() if v is not None and not k.startswith('_')}
+        conf = check_confirmation('DELETE', endpoint, action, 'iam_tool', confirmed or False, context=_ctx)
         if conf:
             return conf
-        return make_api_request('DELETE', endpoint, params=params)
+        return await make_api_request('DELETE', endpoint, params=params)
     elif action == 'add_role_permissions':
         if role_id is None:
             return {'error': 'Missing required parameter: role_id for action add_role_permissions'}
         endpoint = f'/roles/{role_id}/permissions'
         params = build_params(permission_objects=permission_objects)
-        body = {k: v for k, v in {'permission_objects': permission_objects}.items() if v is not None}
-        conf = check_confirmation('POST', endpoint, action, 'iam_tool', confirmed or False, request_params=params, request_body=body)
+        _ctx = {k: v for k, v in locals().items() if v is not None and not k.startswith('_')}
+        conf = check_confirmation('POST', endpoint, action, 'iam_tool', confirmed or False, context=_ctx)
         if conf:
             return conf
-        return make_api_request('POST', endpoint, params=params, json_body=body if body else None)
+        body = {k: v for k, v in {'permission_objects': permission_objects}.items() if v is not None}
+        return await make_api_request('POST', endpoint, params=params, json_body=body if body else None)
     elif action == 'delete_role_permissions':
         if role_id is None:
             return {'error': 'Missing required parameter: role_id for action delete_role_permissions'}
         endpoint = f'/roles/{role_id}/permissions/delete'
         params = build_params(permission_objects=permission_objects)
-        body = {k: v for k, v in {'permission_objects': permission_objects}.items() if v is not None}
-        conf = check_confirmation('POST', endpoint, action, 'iam_tool', confirmed or False, request_params=params, request_body=body)
+        _ctx = {k: v for k, v in locals().items() if v is not None and not k.startswith('_')}
+        conf = check_confirmation('POST', endpoint, action, 'iam_tool', confirmed or False, context=_ctx)
         if conf:
             return conf
-        return make_api_request('POST', endpoint, params=params, json_body=body if body else None)
+        body = {k: v for k, v in {'permission_objects': permission_objects}.items() if v is not None}
+        return await make_api_request('POST', endpoint, params=params, json_body=body if body else None)
     elif action == 'get_role_tags':
         if role_id is None:
             return {'error': 'Missing required parameter: role_id for action get_role_tags'}
         endpoint = f'/roles/{role_id}/tags'
         params = build_params()
-        conf = check_confirmation('GET', endpoint, action, 'iam_tool', confirmed or False, request_params=params, request_body=None)
+        _ctx = {k: v for k, v in locals().items() if v is not None and not k.startswith('_')}
+        conf = check_confirmation('GET', endpoint, action, 'iam_tool', confirmed or False, context=_ctx)
         if conf:
             return conf
-        return make_api_request('GET', endpoint, params=params)
+        return await make_api_request('GET', endpoint, params=params)
     elif action == 'add_role_tags':
         if role_id is None:
             return {'error': 'Missing required parameter: role_id for action add_role_tags'}
         endpoint = f'/roles/{role_id}/tags'
         params = build_params(tags=tags)
-        body = {k: v for k, v in {'tags': tags}.items() if v is not None}
-        conf = check_confirmation('POST', endpoint, action, 'iam_tool', confirmed or False, request_params=params, request_body=body)
+        _ctx = {k: v for k, v in locals().items() if v is not None and not k.startswith('_')}
+        conf = check_confirmation('POST', endpoint, action, 'iam_tool', confirmed or False, context=_ctx)
         if conf:
             return conf
-        return make_api_request('POST', endpoint, params=params, json_body=body if body else None)
+        body = {k: v for k, v in {'tags': tags}.items() if v is not None}
+        return await make_api_request('POST', endpoint, params=params, json_body=body if body else None)
     elif action == 'delete_role_tags':
         if role_id is None:
             return {'error': 'Missing required parameter: role_id for action delete_role_tags'}
         endpoint = f'/roles/{role_id}/tags/delete'
         params = build_params()
-        body = {k: v for k, v in {'key': key, 'value': value, 'tags': tags}.items() if v is not None}
-        conf = check_confirmation('POST', endpoint, action, 'iam_tool', confirmed or False, request_params=params, request_body=body)
+        _ctx = {k: v for k, v in locals().items() if v is not None and not k.startswith('_')}
+        conf = check_confirmation('POST', endpoint, action, 'iam_tool', confirmed or False, context=_ctx)
         if conf:
             return conf
-        return make_api_request('POST', endpoint, params=params, json_body=body if body else None)
+        body = {k: v for k, v in {'key': key, 'value': value, 'tags': tags}.items() if v is not None}
+        return await make_api_request('POST', endpoint, params=params, json_body=body if body else None)
     elif action == 'add_role_ui_profiles':
         if role_id is None:
             return {'error': 'Missing required parameter: role_id for action add_role_ui_profiles'}
         endpoint = f'/roles/{role_id}/ui-profiles'
         params = build_params(ui_profiles=ui_profiles)
-        body = {k: v for k, v in {'ui_profiles': ui_profiles}.items() if v is not None}
-        conf = check_confirmation('POST', endpoint, action, 'iam_tool', confirmed or False, request_params=params, request_body=body)
+        _ctx = {k: v for k, v in locals().items() if v is not None and not k.startswith('_')}
+        conf = check_confirmation('POST', endpoint, action, 'iam_tool', confirmed or False, context=_ctx)
         if conf:
             return conf
-        return make_api_request('POST', endpoint, params=params, json_body=body if body else None)
+        body = {k: v for k, v in {'ui_profiles': ui_profiles}.items() if v is not None}
+        return await make_api_request('POST', endpoint, params=params, json_body=body if body else None)
     elif action == 'delete_role_ui_profiles':
         if role_id is None:
             return {'error': 'Missing required parameter: role_id for action delete_role_ui_profiles'}
         endpoint = f'/roles/{role_id}/ui-profiles/delete'
         params = build_params(ui_profiles=ui_profiles)
-        body = {k: v for k, v in {'ui_profiles': ui_profiles}.items() if v is not None}
-        conf = check_confirmation('POST', endpoint, action, 'iam_tool', confirmed or False, request_params=params, request_body=body)
+        _ctx = {k: v for k, v in locals().items() if v is not None and not k.startswith('_')}
+        conf = check_confirmation('POST', endpoint, action, 'iam_tool', confirmed or False, context=_ctx)
         if conf:
             return conf
-        return make_api_request('POST', endpoint, params=params, json_body=body if body else None)
+        body = {k: v for k, v in {'ui_profiles': ui_profiles}.items() if v is not None}
+        return await make_api_request('POST', endpoint, params=params, json_body=body if body else None)
     elif action == 'search_access_groups':
         params = build_params(limit=limit, cursor=cursor, sort=sort)
-        body = {'filter_expression': filter_expression} if filter_expression else {}
-        conf = check_confirmation('POST', '/access-groups/search', action, 'iam_tool', confirmed or False, request_params=params, request_body=body)
+        _ctx = {k: v for k, v in locals().items() if v is not None and not k.startswith('_')}
+        conf = check_confirmation('POST', '/access-groups/search', action, 'iam_tool', confirmed or False, context=_ctx)
         if conf:
             return conf
-        return make_api_request('POST', '/access-groups/search', params=params, json_body=body)
+        body = {'filter_expression': filter_expression} if filter_expression else {}
+        return await make_api_request('POST', '/access-groups/search', params=params, json_body=body)
     elif action == 'get_access_group':
         if access_group_id is None:
             return {'error': 'Missing required parameter: access_group_id for action get_access_group'}
         endpoint = f'/access-groups/{access_group_id}'
         params = build_params()
-        conf = check_confirmation('GET', endpoint, action, 'iam_tool', confirmed or False, request_params=params, request_body=None)
+        _ctx = {k: v for k, v in locals().items() if v is not None and not k.startswith('_')}
+        conf = check_confirmation('GET', endpoint, action, 'iam_tool', confirmed or False, context=_ctx)
         if conf:
             return conf
-        return make_api_request('GET', endpoint, params=params)
+        return await make_api_request('GET', endpoint, params=params)
     elif action == 'create_access_group':
         params = build_params(name=name)
-        body = {k: v for k, v in {'id': id, 'name': name, 'single_account': single_account, 'account_ids': account_ids, 'tagged_account_ids': tagged_account_ids, 'account_tags': account_tags, 'scopes': scopes}.items() if v is not None}
-        conf = check_confirmation('POST', '/access-groups', action, 'iam_tool', confirmed or False, request_params=params, request_body=body)
+        _ctx = {k: v for k, v in locals().items() if v is not None and not k.startswith('_')}
+        conf = check_confirmation('POST', '/access-groups', action, 'iam_tool', confirmed or False, context=_ctx)
         if conf:
             return conf
-        return make_api_request('POST', '/access-groups', params=params, json_body=body if body else None)
+        body = {k: v for k, v in {'id': id, 'name': name, 'single_account': single_account, 'account_ids': account_ids, 'tagged_account_ids': tagged_account_ids, 'account_tags': account_tags, 'scopes': scopes}.items() if v is not None}
+        return await make_api_request('POST', '/access-groups', params=params, json_body=body if body else None)
     elif action == 'update_access_group':
         if access_group_id is None:
             return {'error': 'Missing required parameter: access_group_id for action update_access_group'}
         endpoint = f'/access-groups/{access_group_id}'
         params = build_params()
-        body = {k: v for k, v in {'name': name}.items() if v is not None}
-        conf = check_confirmation('PATCH', endpoint, action, 'iam_tool', confirmed or False, request_params=params, request_body=body)
+        _ctx = {k: v for k, v in locals().items() if v is not None and not k.startswith('_')}
+        conf = check_confirmation('PATCH', endpoint, action, 'iam_tool', confirmed or False, context=_ctx)
         if conf:
             return conf
-        return make_api_request('PATCH', endpoint, params=params, json_body=body if body else None)
+        body = {k: v for k, v in {'name': name}.items() if v is not None}
+        return await make_api_request('PATCH', endpoint, params=params, json_body=body if body else None)
     elif action == 'delete_access_group':
         if access_group_id is None:
             return {'error': 'Missing required parameter: access_group_id for action delete_access_group'}
         endpoint = f'/access-groups/{access_group_id}'
         params = build_params()
-        conf = check_confirmation('DELETE', endpoint, action, 'iam_tool', confirmed or False, request_params=params, request_body=None)
+        _ctx = {k: v for k, v in locals().items() if v is not None and not k.startswith('_')}
+        conf = check_confirmation('DELETE', endpoint, action, 'iam_tool', confirmed or False, context=_ctx)
         if conf:
             return conf
-        return make_api_request('DELETE', endpoint, params=params)
+        return await make_api_request('DELETE', endpoint, params=params)
     elif action == 'add_access_group_tags':
         if access_group_id is None:
             return {'error': 'Missing required parameter: access_group_id for action add_access_group_tags'}
         endpoint = f'/access-groups/{access_group_id}/tags'
         params = build_params(tags=tags)
-        body = {k: v for k, v in {'tags': tags}.items() if v is not None}
-        conf = check_confirmation('POST', endpoint, action, 'iam_tool', confirmed or False, request_params=params, request_body=body)
+        _ctx = {k: v for k, v in locals().items() if v is not None and not k.startswith('_')}
+        conf = check_confirmation('POST', endpoint, action, 'iam_tool', confirmed or False, context=_ctx)
         if conf:
             return conf
-        return make_api_request('POST', endpoint, params=params, json_body=body if body else None)
+        body = {k: v for k, v in {'tags': tags}.items() if v is not None}
+        return await make_api_request('POST', endpoint, params=params, json_body=body if body else None)
     elif action == 'delete_access_group_tags':
         if access_group_id is None:
             return {'error': 'Missing required parameter: access_group_id for action delete_access_group_tags'}
         endpoint = f'/access-groups/{access_group_id}/tags/delete'
         params = build_params()
-        body = {k: v for k, v in {'key': key, 'value': value, 'tags': tags}.items() if v is not None}
-        conf = check_confirmation('POST', endpoint, action, 'iam_tool', confirmed or False, request_params=params, request_body=body)
+        _ctx = {k: v for k, v in locals().items() if v is not None and not k.startswith('_')}
+        conf = check_confirmation('POST', endpoint, action, 'iam_tool', confirmed or False, context=_ctx)
         if conf:
             return conf
-        return make_api_request('POST', endpoint, params=params, json_body=body if body else None)
+        body = {k: v for k, v in {'key': key, 'value': value, 'tags': tags}.items() if v is not None}
+        return await make_api_request('POST', endpoint, params=params, json_body=body if body else None)
     elif action == 'add_access_group_scopes':
         if access_group_id is None:
             return {'error': 'Missing required parameter: access_group_id for action add_access_group_scopes'}
         endpoint = f'/access-groups/{access_group_id}/scopes'
         params = build_params(scopes=scopes)
-        body = {k: v for k, v in {'scopes': scopes}.items() if v is not None}
-        conf = check_confirmation('POST', endpoint, action, 'iam_tool', confirmed or False, request_params=params, request_body=body)
+        _ctx = {k: v for k, v in locals().items() if v is not None and not k.startswith('_')}
+        conf = check_confirmation('POST', endpoint, action, 'iam_tool', confirmed or False, context=_ctx)
         if conf:
             return conf
-        return make_api_request('POST', endpoint, params=params, json_body=body if body else None)
+        body = {k: v for k, v in {'scopes': scopes}.items() if v is not None}
+        return await make_api_request('POST', endpoint, params=params, json_body=body if body else None)
     elif action == 'get_access_group_scope':
         if access_group_id is None:
             return {'error': 'Missing required parameter: access_group_id for action get_access_group_scope'}
@@ -1040,10 +1056,11 @@ def iam_tool(
             return {'error': 'Missing required parameter: scope_id for action get_access_group_scope'}
         endpoint = f'/access-groups/{access_group_id}/scopes/{scope_id}'
         params = build_params()
-        conf = check_confirmation('GET', endpoint, action, 'iam_tool', confirmed or False, request_params=params, request_body=None)
+        _ctx = {k: v for k, v in locals().items() if v is not None and not k.startswith('_')}
+        conf = check_confirmation('GET', endpoint, action, 'iam_tool', confirmed or False, context=_ctx)
         if conf:
             return conf
-        return make_api_request('GET', endpoint, params=params)
+        return await make_api_request('GET', endpoint, params=params)
     elif action == 'update_access_group_scope':
         if access_group_id is None:
             return {'error': 'Missing required parameter: access_group_id for action update_access_group_scope'}
@@ -1051,11 +1068,12 @@ def iam_tool(
             return {'error': 'Missing required parameter: scope_id for action update_access_group_scope'}
         endpoint = f'/access-groups/{access_group_id}/scopes/{scope_id}'
         params = build_params()
-        body = {k: v for k, v in {'name': name, 'scope_type': scope_type}.items() if v is not None}
-        conf = check_confirmation('PATCH', endpoint, action, 'iam_tool', confirmed or False, request_params=params, request_body=body)
+        _ctx = {k: v for k, v in locals().items() if v is not None and not k.startswith('_')}
+        conf = check_confirmation('PATCH', endpoint, action, 'iam_tool', confirmed or False, context=_ctx)
         if conf:
             return conf
-        return make_api_request('PATCH', endpoint, params=params, json_body=body if body else None)
+        body = {k: v for k, v in {'name': name, 'scope_type': scope_type}.items() if v is not None}
+        return await make_api_request('PATCH', endpoint, params=params, json_body=body if body else None)
     elif action == 'delete_access_group_scope':
         if access_group_id is None:
             return {'error': 'Missing required parameter: access_group_id for action delete_access_group_scope'}
@@ -1063,10 +1081,11 @@ def iam_tool(
             return {'error': 'Missing required parameter: scope_id for action delete_access_group_scope'}
         endpoint = f'/access-groups/{access_group_id}/scopes/{scope_id}'
         params = build_params()
-        conf = check_confirmation('DELETE', endpoint, action, 'iam_tool', confirmed or False, request_params=params, request_body=None)
+        _ctx = {k: v for k, v in locals().items() if v is not None and not k.startswith('_')}
+        conf = check_confirmation('DELETE', endpoint, action, 'iam_tool', confirmed or False, context=_ctx)
         if conf:
             return conf
-        return make_api_request('DELETE', endpoint, params=params)
+        return await make_api_request('DELETE', endpoint, params=params)
     elif action == 'add_scope_object_tags':
         if access_group_id is None:
             return {'error': 'Missing required parameter: access_group_id for action add_scope_object_tags'}
@@ -1074,11 +1093,12 @@ def iam_tool(
             return {'error': 'Missing required parameter: scope_id for action add_scope_object_tags'}
         endpoint = f'/access-groups/{access_group_id}/scopes/{scope_id}/object-tags'
         params = build_params(tags=tags)
-        body = {k: v for k, v in {'tags': tags}.items() if v is not None}
-        conf = check_confirmation('POST', endpoint, action, 'iam_tool', confirmed or False, request_params=params, request_body=body)
+        _ctx = {k: v for k, v in locals().items() if v is not None and not k.startswith('_')}
+        conf = check_confirmation('POST', endpoint, action, 'iam_tool', confirmed or False, context=_ctx)
         if conf:
             return conf
-        return make_api_request('POST', endpoint, params=params, json_body=body if body else None)
+        body = {k: v for k, v in {'tags': tags}.items() if v is not None}
+        return await make_api_request('POST', endpoint, params=params, json_body=body if body else None)
     elif action == 'delete_scope_object_tags':
         if access_group_id is None:
             return {'error': 'Missing required parameter: access_group_id for action delete_scope_object_tags'}
@@ -1086,11 +1106,12 @@ def iam_tool(
             return {'error': 'Missing required parameter: scope_id for action delete_scope_object_tags'}
         endpoint = f'/access-groups/{access_group_id}/scopes/{scope_id}/object-tags/delete'
         params = build_params()
-        body = {k: v for k, v in {'tags': tags}.items() if v is not None}
-        conf = check_confirmation('POST', endpoint, action, 'iam_tool', confirmed or False, request_params=params, request_body=body)
+        _ctx = {k: v for k, v in locals().items() if v is not None and not k.startswith('_')}
+        conf = check_confirmation('POST', endpoint, action, 'iam_tool', confirmed or False, context=_ctx)
         if conf:
             return conf
-        return make_api_request('POST', endpoint, params=params, json_body=body if body else None)
+        body = {k: v for k, v in {'tags': tags}.items() if v is not None}
+        return await make_api_request('POST', endpoint, params=params, json_body=body if body else None)
     elif action == 'add_scope_objects':
         if access_group_id is None:
             return {'error': 'Missing required parameter: access_group_id for action add_scope_objects'}
@@ -1098,11 +1119,12 @@ def iam_tool(
             return {'error': 'Missing required parameter: scope_id for action add_scope_objects'}
         endpoint = f'/access-groups/{access_group_id}/scopes/{scope_id}/objects'
         params = build_params(objects=objects)
-        body = {k: v for k, v in {'objects': objects}.items() if v is not None}
-        conf = check_confirmation('POST', endpoint, action, 'iam_tool', confirmed or False, request_params=params, request_body=body)
+        _ctx = {k: v for k, v in locals().items() if v is not None and not k.startswith('_')}
+        conf = check_confirmation('POST', endpoint, action, 'iam_tool', confirmed or False, context=_ctx)
         if conf:
             return conf
-        return make_api_request('POST', endpoint, params=params, json_body=body if body else None)
+        body = {k: v for k, v in {'objects': objects}.items() if v is not None}
+        return await make_api_request('POST', endpoint, params=params, json_body=body if body else None)
     elif action == 'delete_scope_objects':
         if access_group_id is None:
             return {'error': 'Missing required parameter: access_group_id for action delete_scope_objects'}
@@ -1110,11 +1132,12 @@ def iam_tool(
             return {'error': 'Missing required parameter: scope_id for action delete_scope_objects'}
         endpoint = f'/access-groups/{access_group_id}/scopes/{scope_id}/objects/delete'
         params = build_params(objects=objects)
-        body = {k: v for k, v in {'objects': objects}.items() if v is not None}
-        conf = check_confirmation('POST', endpoint, action, 'iam_tool', confirmed or False, request_params=params, request_body=body)
+        _ctx = {k: v for k, v in locals().items() if v is not None and not k.startswith('_')}
+        conf = check_confirmation('POST', endpoint, action, 'iam_tool', confirmed or False, context=_ctx)
         if conf:
             return conf
-        return make_api_request('POST', endpoint, params=params, json_body=body if body else None)
+        body = {k: v for k, v in {'objects': objects}.items() if v is not None}
+        return await make_api_request('POST', endpoint, params=params, json_body=body if body else None)
     elif action == 'add_scope_always_allowed_permissions':
         if access_group_id is None:
             return {'error': 'Missing required parameter: access_group_id for action add_scope_always_allowed_permissions'}
@@ -1122,11 +1145,12 @@ def iam_tool(
             return {'error': 'Missing required parameter: scope_id for action add_scope_always_allowed_permissions'}
         endpoint = f'/access-groups/{access_group_id}/scopes/{scope_id}/always_allowed_permissions'
         params = build_params(always_allowed_permissions=always_allowed_permissions)
-        body = {k: v for k, v in {'always_allowed_permissions': always_allowed_permissions}.items() if v is not None}
-        conf = check_confirmation('POST', endpoint, action, 'iam_tool', confirmed or False, request_params=params, request_body=body)
+        _ctx = {k: v for k, v in locals().items() if v is not None and not k.startswith('_')}
+        conf = check_confirmation('POST', endpoint, action, 'iam_tool', confirmed or False, context=_ctx)
         if conf:
             return conf
-        return make_api_request('POST', endpoint, params=params, json_body=body if body else None)
+        body = {k: v for k, v in {'always_allowed_permissions': always_allowed_permissions}.items() if v is not None}
+        return await make_api_request('POST', endpoint, params=params, json_body=body if body else None)
     elif action == 'delete_scope_always_allowed_permissions':
         if access_group_id is None:
             return {'error': 'Missing required parameter: access_group_id for action delete_scope_always_allowed_permissions'}
@@ -1134,16 +1158,17 @@ def iam_tool(
             return {'error': 'Missing required parameter: scope_id for action delete_scope_always_allowed_permissions'}
         endpoint = f'/access-groups/{access_group_id}/scopes/{scope_id}/always_allowed_permissions/delete'
         params = build_params(always_allowed_permissions=always_allowed_permissions)
-        body = {k: v for k, v in {'always_allowed_permissions': always_allowed_permissions}.items() if v is not None}
-        conf = check_confirmation('POST', endpoint, action, 'iam_tool', confirmed or False, request_params=params, request_body=body)
+        _ctx = {k: v for k, v in locals().items() if v is not None and not k.startswith('_')}
+        conf = check_confirmation('POST', endpoint, action, 'iam_tool', confirmed or False, context=_ctx)
         if conf:
             return conf
-        return make_api_request('POST', endpoint, params=params, json_body=body if body else None)
+        body = {k: v for k, v in {'always_allowed_permissions': always_allowed_permissions}.items() if v is not None}
+        return await make_api_request('POST', endpoint, params=params, json_body=body if body else None)
     else:
         return {'error': f'Unknown action: {action}. Valid actions: search_accounts, get_account, create_account, delete_account, enable_account, disable_account, reset_password, get_account_tags, add_account_tags, delete_account_tags, get_account_ui_profiles, get_password_policies, update_password_policies, search_roles, get_role, create_role, update_role, delete_role, add_role_permissions, delete_role_permissions, get_role_tags, add_role_tags, delete_role_tags, add_role_ui_profiles, delete_role_ui_profiles, search_access_groups, get_access_group, create_access_group, update_access_group, delete_access_group, add_access_group_tags, delete_access_group_tags, add_access_group_scopes, get_access_group_scope, update_access_group_scope, delete_access_group_scope, add_scope_object_tags, delete_scope_object_tags, add_scope_objects, delete_scope_objects, add_scope_always_allowed_permissions, delete_scope_always_allowed_permissions'}
 
 @log_tool_execution
-def tag_tool(
+async def tag_tool(
     action: str,  # One of: search, get, get_usages, search_usages
     cursor: Optional[str] = None,
     filter_expression: Optional[str] = None,
@@ -1256,39 +1281,43 @@ def tag_tool(
     # Route to appropriate API based on action
     if action == 'search':
         params = build_params(limit=limit, cursor=cursor, sort=sort)
-        body = {'filter_expression': filter_expression} if filter_expression else {}
-        conf = check_confirmation('POST', '/management/tags/search', action, 'tag_tool', confirmed or False, request_params=params, request_body=body)
+        _ctx = {k: v for k, v in locals().items() if v is not None and not k.startswith('_')}
+        conf = check_confirmation('POST', '/management/tags/search', action, 'tag_tool', confirmed or False, context=_ctx)
         if conf:
             return conf
-        return make_api_request('POST', '/management/tags/search', params=params, json_body=body)
+        body = {'filter_expression': filter_expression} if filter_expression else {}
+        return await make_api_request('POST', '/management/tags/search', params=params, json_body=body)
     elif action == 'get':
         if tag_id is None:
             return {'error': 'Missing required parameter: tag_id for action get'}
         endpoint = f'/management/tags/{tag_id}'
         params = build_params()
-        conf = check_confirmation('GET', endpoint, action, 'tag_tool', confirmed or False, request_params=params, request_body=None)
+        _ctx = {k: v for k, v in locals().items() if v is not None and not k.startswith('_')}
+        conf = check_confirmation('GET', endpoint, action, 'tag_tool', confirmed or False, context=_ctx)
         if conf:
             return conf
-        return make_api_request('GET', endpoint, params=params)
+        return await make_api_request('GET', endpoint, params=params)
     elif action == 'get_usages':
         if tag_id is None:
             return {'error': 'Missing required parameter: tag_id for action get_usages'}
         endpoint = f'/management/tags/{tag_id}/usages'
         params = build_params(limit=limit, cursor=cursor, sort=sort)
-        conf = check_confirmation('GET', endpoint, action, 'tag_tool', confirmed or False, request_params=params, request_body=None)
+        _ctx = {k: v for k, v in locals().items() if v is not None and not k.startswith('_')}
+        conf = check_confirmation('GET', endpoint, action, 'tag_tool', confirmed or False, context=_ctx)
         if conf:
             return conf
-        return make_api_request('GET', endpoint, params=params)
+        return await make_api_request('GET', endpoint, params=params)
     elif action == 'search_usages':
         if tag_id is None:
             return {'error': 'Missing required parameter: tag_id for action search_usages'}
         endpoint = f'/management/tags/{tag_id}/usages/search'
         params = build_params(limit=limit, cursor=cursor, sort=sort)
-        body = {'filter_expression': filter_expression} if filter_expression else {}
-        conf = check_confirmation('POST', endpoint, action, 'tag_tool', confirmed or False, request_params=params, request_body=body)
+        _ctx = {k: v for k, v in locals().items() if v is not None and not k.startswith('_')}
+        conf = check_confirmation('POST', endpoint, action, 'tag_tool', confirmed or False, context=_ctx)
         if conf:
             return conf
-        return make_api_request('POST', endpoint, params=params, json_body=body)
+        body = {'filter_expression': filter_expression} if filter_expression else {}
+        return await make_api_request('POST', endpoint, params=params, json_body=body)
     else:
         return {'error': f'Unknown action: {action}. Valid actions: search, get, get_usages, search_usages'}
 
